@@ -1,0 +1,49 @@
+﻿services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq-local
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: dev
+      RABBITMQ_DEFAULT_PASS: devpass
+      RABBITMQ_ERLANG_COOKIE: rabbitmq-cookie
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./rabbitmq/init.sh:/etc/rabbitmq/init.sh:ro
+    command: ["bash", "/etc/rabbitmq/init.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  postgres:
+    image: postgres:16
+    container_name: postgres-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payment_admin
+      POSTGRES_PASSWORD: payment_admin
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_admin -d payments"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  rabbitmq-data:
+  postgres-data:
+

@@ -1,0 +1,163 @@
+﻿{
+  "rabbit_version": "3.13.3",
+  "users": [
+    {
+      "name": "dev",
+      "password_hash": "m7VwrpCFBLTMkgBb9IEEHNIwBJU=",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": "administrator"
+    }
+  ],
+  "vhosts": [
+    {
+      "name": "/"
+    }
+  ],
+  "permissions": [
+    {
+      "user": "dev",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "parameters": [],
+  "global_parameters": [
+    {
+      "name": "internal_cluster_id",
+      "value": "rabbitmq-local"
+    }
+  ],
+  "policies": [
+    {
+      "vhost": "/",
+      "name": "quorum",
+      "pattern": "^quorum.*",
+      "definition": {
+        "queue-type": "quorum"
+      },
+      "priority": 0,
+      "apply-to": "queues"
+    }
+  ],
+  "queues": [
+    {
+      "name": "payments.outbound.q",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-dead-letter-exchange": "payments.dlx",
+        "x-dead-letter-routing-key": "payments.retry"
+      }
+    },
+    {
+      "name": "payments.retry.q",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-message-ttl": 30000,
+        "x-dead-letter-exchange": "payments.topic"
+      }
+    },
+    {
+      "name": "payments.dlq",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-queue-mode": "lazy"
+      }
+    },
+    {
+      "name": "gateway.dispatch.q",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-dead-letter-exchange": "payments.dlx",
+        "x-dead-letter-routing-key": "gateway.dispatch.dlq"
+      }
+    },
+    {
+      "name": "gateway.intermediate.q",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-dead-letter-exchange": "payments.dlx",
+        "x-dead-letter-routing-key": "gateway.intermediate.dlq"
+      }
+    },
+    {
+      "name": "gateway.final.q",
+      "vhost": "/",
+      "durable": true,
+      "arguments": {
+        "x-dead-letter-exchange": "payments.dlx",
+        "x-dead-letter-routing-key": "gateway.final.dlq"
+      }
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "payments.topic",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true
+    },
+    {
+      "name": "gateway.topic",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true
+    },
+    {
+      "name": "payments.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true
+    }
+  ],
+  "bindings": [
+    {
+      "source": "payments.topic",
+      "vhost": "/",
+      "destination": "payments.outbound.q",
+      "destination_type": "queue",
+      "routing_key": "payment.created.*"
+    },
+    {
+      "source": "payments.dlx",
+      "vhost": "/",
+      "destination": "payments.retry.q",
+      "destination_type": "queue",
+      "routing_key": "payments.retry"
+    },
+    {
+      "source": "payments.dlx",
+      "vhost": "/",
+      "destination": "payments.dlq",
+      "destination_type": "queue",
+      "routing_key": "#"
+    },
+    {
+      "source": "gateway.topic",
+      "vhost": "/",
+      "destination": "gateway.intermediate.q",
+      "destination_type": "queue",
+      "routing_key": "gateway.intermediate.*"
+    },
+    {
+      "source": "gateway.topic",
+      "vhost": "/",
+      "destination": "gateway.final.q",
+      "destination_type": "queue",
+      "routing_key": "gateway.final.*"
+    },
+    {
+      "source": "gateway.topic",
+      "vhost": "/",
+      "destination": "gateway.dispatch.q",
+      "destination_type": "queue",
+      "routing_key": "gateway.dispatch.*"
+    }
+  ]
+}
