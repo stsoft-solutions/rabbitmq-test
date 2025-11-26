@@ -1,14 +1,14 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using Dapper;
-using System.Diagnostics;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Npgsql;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
-using Shared;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using Rmq = RabbitMQ.Client;
+using Shared;
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -16,12 +16,16 @@ var builder = Host.CreateApplicationBuilder(args);
 var pg = builder.Configuration.GetConnectionString("Payments")
          ?? "Host=localhost;Port=5432;Database=payments;Username=app;Password=app;Pooling=true";
 var amqpUri = builder.Configuration.GetValue<string>("Rabbit:Uri")
-             ?? "amqp://guest:guest@localhost:5672/";
+              ?? "amqp://guest:guest@localhost:5672/";
 
 builder.Services.AddSingleton<NpgsqlDataSource>(_ => NpgsqlDataSource.Create(pg));
-builder.Services.AddSingleton<IConnection>(sp =>
+builder.Services.AddSingleton<Rmq.IConnection>(sp =>
 {
-    var f = new ConnectionFactory { Uri = new Uri(amqpUri), DispatchConsumersAsync = true, AutomaticRecoveryEnabled = true };
+    var f = new Rmq.ConnectionFactory
+    {
+        Uri = new Uri(amqpUri),
+        AutomaticRecoveryEnabled = true
+    };
     return f.CreateConnection();
 });
 
@@ -31,7 +35,7 @@ builder.Services.AddHostedService<StatusConsumerService>();
 // OpenTelemetry Tracing for worker
 builder.Services.AddOpenTelemetry()
     .WithTracing(tp => tp
-        .ConfigureResource(r => r.AddService(serviceName: "PaymentService.Worker", serviceVersion: "1.0.0"))
+        .ConfigureResource(r => r.AddService("PaymentService.Worker", serviceVersion: "1.0.0"))
         .AddSource(Tracing.WorkerActivitySourceName)
         .AddConsoleExporter());
 
@@ -39,7 +43,8 @@ var app = builder.Build();
 await app.RunAsync();
 
 // Background service: polls outbox and publishes to Rabbit with confirms
-class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataSource ds, IConnection connection) : BackgroundService
+internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataSource ds, Rmq.IConnection connection)
+    : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -60,24 +65,22 @@ class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataS
                 {
                     var provider = (string)(it.payload?.gateway_provider ?? "simulated");
                     var routingKey = Topology.GatewayRequestCreated(provider);
-                    var body = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(it.payload));
+                    var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(it.payload));
                     var props = channel.CreateBasicProperties();
                     props.Persistent = true;
                     // Reuse message_id and propagate trace context
-                    Guid messageId = (Guid)it.message_id;
+                    var messageId = (Guid)it.message_id;
                     props.MessageId = messageId.ToString();
                     props.CorrelationId = (it.aggregate_id as Guid?)?.ToString();
-                    props.Headers = new Dictionary<string, object> { ["schema_version"] = 1, ["provider"] = provider, ["x-retry-count"] = 0 };
+                    props.Headers = new Dictionary<string, object>
+                        { ["schema_version"] = 1, ["provider"] = provider, ["x-retry-count"] = 0 };
 
                     // Create producer span and inject context
-                    string? traceparent = it.traceparent as string;
-                    string? tracestate = it.tracestate as string;
-                    string? baggage = it.baggage as string;
+                    var traceparent = it.traceparent as string;
+                    var tracestate = it.tracestate as string;
+                    var baggage = it.baggage as string;
                     ActivityContext parentCtx = default;
-                    if (!string.IsNullOrWhiteSpace(traceparent))
-                    {
-                        ActivityContext.TryParse(traceparent, tracestate, out parentCtx);
-                    }
+                    if (!string.IsNullOrWhiteSpace(traceparent)) ActivityContext.TryParse(traceparent, tracestate, out parentCtx);
                     using var activity = Tracing.WorkerActivitySource.StartActivity(
                         "publish x.gateway.request",
                         ActivityKind.Producer,
@@ -101,13 +104,15 @@ class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataS
                     }
 
                     // Cast dynamic values to static types to avoid dynamic dispatch on logger extension methods
-                    long outboxId = (long)it.id;
-                    Guid paymentId = (Guid)it.aggregate_id;
+                    var outboxId = (long)it.id;
+                    var paymentId = (Guid)it.aggregate_id;
                     await MarkSentAsync(ds, outboxId, paymentId, stoppingToken);
                     logger.LogInformation("Published and marked Sent outboxId={Id} payment={PaymentId}", outboxId, paymentId);
                 }
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+            }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Error in OutboxPublisherService loop");
@@ -144,14 +149,18 @@ returning o.id, o.aggregate_id, o.type, o.payload, o.attempt_count, o.message_id
     {
         var delay = attempt switch { 1 => "5 seconds", 2 => "30 seconds", _ => "300 seconds" };
         await using var conn = await ds.OpenConnectionAsync(ct);
-        await conn.ExecuteAsync($"update outbox set processing_status='Pending', locked_until = now() + interval '{delay}', last_error='Publish confirm timeout' where id = @id", new { id });
+        await conn.ExecuteAsync(
+            $"update outbox set processing_status='Pending', locked_until = now() + interval '{delay}', last_error='Publish confirm timeout' where id = @id",
+            new { id });
     }
 
     private static async Task MarkSentAsync(NpgsqlDataSource ds, long id, Guid paymentId, CancellationToken ct)
     {
         await using var conn = await ds.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
-        await conn.ExecuteAsync("update outbox set processing_status='Sent', processed_at = now(), locked_until=null, lock_token=null where id = @id", new { id }, tx);
+        await conn.ExecuteAsync(
+            "update outbox set processing_status='Sent', processed_at = now(), locked_until=null, lock_token=null where id = @id",
+            new { id }, tx);
         await conn.ExecuteAsync("update payments set status='Dispatched' where payment_id=@pid", new { pid = paymentId }, tx);
         await conn.ExecuteAsync(@"insert into payment_status_history(payment_id, status, source) values(@pid, 'Dispatched', 'Worker')",
             new { pid = paymentId }, tx);
@@ -160,36 +169,38 @@ returning o.id, o.aggregate_id, o.type, o.payload, o.attempt_count, o.message_id
 }
 
 // Background service: consumes gateway status updates and updates DB idempotently
-class StatusConsumerService(ILogger<StatusConsumerService> logger, NpgsqlDataSource ds, IConnection connection) : BackgroundService
+internal class StatusConsumerService(ILogger<StatusConsumerService> logger, NpgsqlDataSource ds, Rmq.IConnection connection) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var channel = connection.CreateModel();
         channel.BasicQos(0, 32, false);
         var consumer = new AsyncEventingBasicConsumer(channel);
-        consumer.Received += async (object? _, BasicDeliverEventArgs ea) =>
+        consumer.ReceivedAsync += async (_, ea) =>
         {
             try
             {
                 var messageId = ea.BasicProperties?.MessageId ?? Guid.NewGuid().ToString();
                 var body = ea.Body.ToArray();
-                var payload = System.Text.Json.JsonDocument.Parse(Encoding.UTF8.GetString(body)).RootElement;
+                var payload = JsonDocument.Parse(Encoding.UTF8.GetString(body.AsSpan())).RootElement;
                 var provider = ea.BasicProperties?.Headers != null && ea.BasicProperties.Headers.TryGetValue("provider", out var pv)
-                    ? pv?.ToString() ?? "simulated" : "simulated";
+                    ? pv?.ToString() ?? "simulated"
+                    : "simulated";
                 var paymentId = payload.TryGetProperty("payment_id", out var p) ? p.GetGuid() : Guid.Empty;
                 var final = ea.RoutingKey.EndsWith(".final", StringComparison.OrdinalIgnoreCase);
-                var statusValue = final ? (payload.TryGetProperty("final_status", out var fs) ? fs.GetString() : "Authorized") :
-                                          (payload.TryGetProperty("status_code", out var sc) ? sc.GetString() : "AuthorizedPendingCapture");
+                var statusValue = final ? payload.TryGetProperty("final_status", out var fs) ? fs.GetString() : "Authorized" :
+                    payload.TryGetProperty("status_code", out var sc) ? sc.GetString() : "AuthorizedPendingCapture";
 
                 // Extract context and create consumer span
                 ActivityContext parentCtx = default;
                 if (ea.BasicProperties?.Headers != null)
                 {
                     var headers = ea.BasicProperties.Headers;
-                    string? tp = headers.TryGetValue("traceparent", out var tpv) ? tpv?.ToString() : null;
-                    string? ts = headers.TryGetValue("tracestate", out var tsv) ? tsv?.ToString() : null;
+                    var tp = headers.TryGetValue("traceparent", out var tpv) ? tpv?.ToString() : null;
+                    var ts = headers.TryGetValue("tracestate", out var tsv) ? tsv?.ToString() : null;
                     if (!string.IsNullOrWhiteSpace(tp)) ActivityContext.TryParse(tp, ts, out parentCtx);
                 }
+
                 using var activity = Tracing.WorkerActivitySource.StartActivity(
                     "consume x.gateway.status",
                     ActivityKind.Consumer,
@@ -235,10 +246,19 @@ class StatusConsumerService(ILogger<StatusConsumerService> logger, NpgsqlDataSou
                 props.Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount };
                 ch.BasicPublish(retryExchange, rk, props, ea.Body);
                 // Ack original to prevent redelivery storm
-                try { channel.BasicAck(ea.DeliveryTag, false); } catch { }
+                try
+                {
+                    channel.BasicAck(ea.DeliveryTag, false);
+                }
+                catch
+                {
+                }
+
                 // log
-                logger.LogWarning(ex, "Status processing failed; republished to {RetryExchange} rk={RoutingKey} retry={Retry}", retryExchange, rk, retryCount);
+                logger.LogWarning(ex, "Status processing failed; republished to {RetryExchange} rk={RoutingKey} retry={Retry}",
+                    retryExchange, rk, retryCount);
             }
+            return; // ensure Task-returning delegate completes
         };
         channel.BasicConsume(Topology.QueueWorkerStatus, false, consumer);
 

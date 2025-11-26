@@ -1,52 +1,56 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using Rmq = RabbitMQ.Client;
 using Shared;
-using System.Diagnostics;
-using OpenTelemetry;
-using OpenTelemetry.Trace;
-using OpenTelemetry.Resources;
 
 var builder = Host.CreateApplicationBuilder(args);
 
 var amqpUri = builder.Configuration.GetValue<string>("Rabbit:Uri")
-             ?? "amqp://guest:guest@localhost:5672/";
+              ?? "amqp://guest:guest@localhost:5672/";
 var provider = builder.Configuration.GetValue<string>("Provider") ?? "simulated";
 
-builder.Services.AddSingleton<IConnection>(sp =>
+builder.Services.AddSingleton<Rmq.IConnection>(sp =>
 {
-    var f = new ConnectionFactory { Uri = new Uri(amqpUri), DispatchConsumersAsync = true, AutomaticRecoveryEnabled = true };
-    return f.CreateConnection();
+    var f = new Rmq.ConnectionFactory
+    {
+        Uri = new Uri(amqpUri),
+        AutomaticRecoveryEnabled = true
+    };
+    return ((Rmq.IConnectionFactory)f).CreateConnection();
 });
 
 builder.Services.AddHostedService(sp => new GatewayService(
-    sp.GetRequiredService<IConnection>(),
+    sp.GetRequiredService<Rmq.IConnection>(),
     sp.GetRequiredService<ILogger<GatewayService>>(),
     provider));
 
 // OpenTelemetry for Gateway
 builder.Services.AddOpenTelemetry()
     .WithTracing(tp => tp
-        .ConfigureResource(r => r.AddService(serviceName: "PaymentGateway", serviceVersion: "1.0.0"))
+        .ConfigureResource(r => r.AddService("PaymentGateway", serviceVersion: "1.0.0"))
         .AddSource(Tracing.GatewayActivitySourceName)
         .AddConsoleExporter());
 
 var app = builder.Build();
 await app.RunAsync();
 
-class GatewayService(IConnection connection, ILogger<GatewayService> logger, string provider) : BackgroundService
+internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService> logger, string provider) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var ch = connection.CreateModel();
         ch.BasicQos(0, 16, false);
         var consumer = new AsyncEventingBasicConsumer(ch);
-        consumer.Received += async (object? _, BasicDeliverEventArgs ea) =>
+        consumer.ReceivedAsync += async (_, ea) =>
         {
             var rk = ea.RoutingKey; // e.g., gateway.simulated.payment.created
             try
@@ -55,16 +59,17 @@ class GatewayService(IConnection connection, ILogger<GatewayService> logger, str
                 ActivityContext parentCtx = default;
                 if (ea.BasicProperties?.Headers != null && ea.BasicProperties.Headers.TryGetValue("traceparent", out var tpv))
                 {
-                    string? tp = tpv?.ToString();
-                    string? ts = ea.BasicProperties.Headers.TryGetValue("tracestate", out var tsv) ? tsv?.ToString() : null;
+                    var tp = tpv?.ToString();
+                    var ts = ea.BasicProperties.Headers.TryGetValue("tracestate", out var tsv) ? tsv?.ToString() : null;
                     if (!string.IsNullOrWhiteSpace(tp)) ActivityContext.TryParse(tp, ts, out parentCtx);
                 }
+
                 using var consume = Tracing.GatewayActivitySource.StartActivity(
                     "consume x.gateway.request", ActivityKind.Consumer, parentCtx);
                 consume?.SetTag("messaging.system", "rabbitmq");
                 consume?.SetTag("messaging.rabbitmq.routing_key", rk);
 
-                var doc = JsonDocument.Parse(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                var doc = JsonDocument.Parse(Encoding.UTF8.GetString(ea.Body.Span));
                 var root = doc.RootElement;
                 var paymentId = root.GetProperty("payment_id").GetGuid();
 
@@ -101,10 +106,13 @@ class GatewayService(IConnection connection, ILogger<GatewayService> logger, str
             {
                 // Route to appropriate retry exchange preserving original routing key
                 var retryCount = 1;
-                if (ea.BasicProperties?.Headers != null && ea.BasicProperties.Headers.TryGetValue("x-retry-count", out var rc) && rc is byte[] b)
+                if (ea.BasicProperties?.Headers != null && ea.BasicProperties.Headers.TryGetValue("x-retry-count", out var rc) &&
+                    rc is byte[] b)
                 {
-                    if (int.TryParse(Encoding.UTF8.GetString(b), out var parsed)) retryCount = parsed + 1; else retryCount = 2;
+                    if (int.TryParse(Encoding.UTF8.GetString(b), out var parsed)) retryCount = parsed + 1;
+                    else retryCount = 2;
                 }
+
                 var retryExchange = Topology.NextRequestRetryExchange(retryCount);
                 using var ch2 = connection.CreateModel();
                 var props = ch2.CreateBasicProperties();
@@ -126,6 +134,7 @@ class GatewayService(IConnection connection, ILogger<GatewayService> logger, str
                 ch.BasicAck(ea.DeliveryTag, false);
                 logger.LogError(ex, "Gateway terminal error, sent to DLX rk={Rk}", rk);
             }
+            return;
         };
         ch.BasicConsume(Topology.QueueGatewayRequestSimulated, false, consumer);
 
@@ -149,10 +158,11 @@ class GatewayService(IConnection connection, ILogger<GatewayService> logger, str
             props.Headers["traceparent"] = activity.Id;
             if (!string.IsNullOrEmpty(activity.TraceStateString)) props.Headers["tracestate"] = activity.TraceStateString;
         }
+
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(body));
         ch.BasicPublish(Topology.ExchangeGatewayStatus, routingKey, true, props, bytes);
     }
 }
 
 // A marker exception to simulate transient problems (e.g., network hiccup to the real gateway)
-class TransientGatewayException(string message) : Exception(message);
+internal class TransientGatewayException(string message) : Exception(message);

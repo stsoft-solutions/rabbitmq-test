@@ -18,22 +18,39 @@ public static class Topology
     public const string QueueWorkerStatus = "q.worker.status";
 
     // Routing keys patterns
-    public static string GatewayRequestCreated(string provider) => $"gateway.{provider}.payment.created";
-    public static string GatewayStatusIntermediate(string provider) => $"gateway.{provider}.payment.status.intermediate";
-    public static string GatewayStatusFinal(string provider) => $"gateway.{provider}.payment.status.final";
+    public static string GatewayRequestCreated(string provider)
+    {
+        return $"gateway.{provider}.payment.created";
+    }
+
+    public static string GatewayStatusIntermediate(string provider)
+    {
+        return $"gateway.{provider}.payment.status.intermediate";
+    }
+
+    public static string GatewayStatusFinal(string provider)
+    {
+        return $"gateway.{provider}.payment.status.final";
+    }
 
     // Retry helper chooses next exchange based on attempt number (1-based)
-    public static string NextRequestRetryExchange(int attempt) => attempt switch
+    public static string NextRequestRetryExchange(int attempt)
     {
-        1 => ExchangeGatewayRequestRetry5s,
-        2 => ExchangeGatewayRequestRetry30s,
-        _ => ExchangeGatewayRequestRetry5m
-    };
+        return attempt switch
+        {
+            1 => ExchangeGatewayRequestRetry5s,
+            2 => ExchangeGatewayRequestRetry30s,
+            _ => ExchangeGatewayRequestRetry5m
+        };
+    }
 
-    public static string NextStatusRetryExchange(int attempt) => attempt switch
+    public static string NextStatusRetryExchange(int attempt)
     {
-        1 => ExchangeGatewayStatusRetry5s,
-        2 => ExchangeGatewayStatusRetry30s,
-        _ => ExchangeGatewayStatusRetry5m
-    };
+        return attempt switch
+        {
+            1 => ExchangeGatewayStatusRetry5s,
+            2 => ExchangeGatewayStatusRetry30s,
+            _ => ExchangeGatewayStatusRetry5m
+        };
+    }
 }

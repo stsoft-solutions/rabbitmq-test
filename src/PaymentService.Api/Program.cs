@@ -1,7 +1,5 @@
-﻿using System.Data;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text.Json;
-using System.Linq;
 using Dapper;
 using Npgsql;
 using OpenTelemetry.Resources;
@@ -45,8 +43,8 @@ app.MapPost("/payments", async (PaymentRequest req, NpgsqlDataSource ds) =>
     var outboxMessageId = Guid.NewGuid();
 
     // Capture W3C context from current Activity
-    var traceparent = Activity.Current?.Id;
-    var tracestate = Activity.Current?.TraceStateString;
+    var activityId = Activity.Current?.Id;
+    var traceState = Activity.Current?.TraceStateString;
     var baggagePairs = Activity.Current?.Baggage?.Select(kv => $"{kv.Key}={kv.Value}");
     var baggage = baggagePairs is null ? null : string.Join(", ", baggagePairs);
 
@@ -72,7 +70,11 @@ app.MapPost("/payments", async (PaymentRequest req, NpgsqlDataSource ds) =>
 
     await conn.ExecuteAsync(@"insert into outbox (aggregate_type, aggregate_id, type, payload, message_id, traceparent, tracestate, baggage)
         values ('Payment', @id, 'PaymentCreated', CAST(@payload as jsonb), @mid, @traceparent, @tracestate, @baggage)",
-        new { id = paymentId, payload, mid = outboxMessageId, traceparent, tracestate, baggage }, tx);
+        new
+        {
+            id = paymentId, payload, mid = outboxMessageId, traceparent = activityId,
+            tracestate = traceState, baggage
+        }, tx);
 
     await tx.CommitAsync();
 
@@ -81,4 +83,4 @@ app.MapPost("/payments", async (PaymentRequest req, NpgsqlDataSource ds) =>
 
 app.Run();
 
-record PaymentRequest(decimal Amount, string Currency, Guid CustomerId, string? Provider, string? IdempotencyKey);
+internal record PaymentRequest(decimal Amount, string Currency, Guid CustomerId, string? Provider, string? IdempotencyKey);

@@ -1,5 +1,4 @@
-﻿using System.Net.Http.Json;
-using OpenTelemetry.Resources;
+﻿using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -7,15 +6,12 @@ var builder = WebApplication.CreateBuilder(args);
 var paymentServiceBase = builder.Configuration.GetValue<string>(
     "PaymentService:BaseUrl") ?? "http://localhost:5081";
 
-builder.Services.AddHttpClient("PaymentService", client =>
-{
-    client.BaseAddress = new Uri(paymentServiceBase);
-});
+builder.Services.AddHttpClient("PaymentService", client => { client.BaseAddress = new Uri(paymentServiceBase); });
 
 // OpenTelemetry Tracing (HTTP server + client)
 builder.Services.AddOpenTelemetry()
     .WithTracing(tp => tp
-        .ConfigureResource(r => r.AddService(serviceName: "Api", serviceVersion: "1.0.0"))
+        .ConfigureResource(r => r.AddService("Api", serviceVersion: "1.0.0"))
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
         .AddConsoleExporter());
