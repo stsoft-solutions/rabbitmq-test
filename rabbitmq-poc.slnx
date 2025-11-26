@@ -1,2 +1,7 @@
 <Solution>
+  <Project Path="src/Api/Api.csproj" />
+  <Project Path="src/PaymentGateway/PaymentGateway.csproj" />
+  <Project Path="src/PaymentService.Api/PaymentService.Api.csproj" />
+  <Project Path="src/PaymentService.Worker/PaymentService.Worker.csproj" />
+  <Project Path="src/Shared/Shared.csproj" />
 </Solution>

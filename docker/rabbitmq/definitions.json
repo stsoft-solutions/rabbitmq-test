@@ -1,0 +1,125 @@
+﻿{
+  "rabbit_version": "3.13.0",
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "permissions": [],
+  "parameters": [],
+  "policies": [],
+  "queues": [
+    {
+      "name": "q.gateway.request.simulated",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "x.dlx",
+        "x-dead-letter-routing-key": "dead.gateway.request.simulated"
+      }
+    },
+    {
+      "name": "q.gateway.request.simulated.retry.5s",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "x.gateway.request"
+      }
+    },
+    {
+      "name": "q.gateway.request.simulated.retry.30s",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 30000,
+        "x-dead-letter-exchange": "x.gateway.request"
+      }
+    },
+    {
+      "name": "q.gateway.request.simulated.retry.5m",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 300000,
+        "x-dead-letter-exchange": "x.gateway.request"
+      }
+    },
+
+    {
+      "name": "q.worker.status",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "x.dlx",
+        "x-dead-letter-routing-key": "dead.worker.status"
+      }
+    },
+    {
+      "name": "q.worker.status.retry.5s",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "x.gateway.status"
+      }
+    },
+    {
+      "name": "q.worker.status.retry.30s",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 30000,
+        "x-dead-letter-exchange": "x.gateway.status"
+      }
+    },
+    {
+      "name": "q.worker.status.retry.5m",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 300000,
+        "x-dead-letter-exchange": "x.gateway.status"
+      }
+    },
+
+    {
+      "name": "q.dlx",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+  "exchanges": [
+    { "name": "x.gateway.request", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.status",  "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.request.retry.5s",  "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.request.retry.30s", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.request.retry.5m",  "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.status.retry.5s",   "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.status.retry.30s",  "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.gateway.status.retry.5m",   "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "x.dlx",             "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} }
+  ],
+  "bindings": [
+    { "vhost": "/", "source": "x.gateway.request", "destination": "q.gateway.request.simulated", "destination_type": "queue", "routing_key": "gateway.simulated.payment.*", "arguments": {} },
+
+    { "vhost": "/", "source": "x.gateway.request.retry.5s",  "destination": "q.gateway.request.simulated.retry.5s",  "destination_type": "queue", "routing_key": "#", "arguments": {} },
+    { "vhost": "/", "source": "x.gateway.request.retry.30s", "destination": "q.gateway.request.simulated.retry.30s", "destination_type": "queue", "routing_key": "#", "arguments": {} },
+    { "vhost": "/", "source": "x.gateway.request.retry.5m",  "destination": "q.gateway.request.simulated.retry.5m",  "destination_type": "queue", "routing_key": "#", "arguments": {} },
+
+    { "vhost": "/", "source": "x.gateway.status", "destination": "q.worker.status", "destination_type": "queue", "routing_key": "gateway.*.payment.status.*", "arguments": {} },
+    { "vhost": "/", "source": "x.gateway.status.retry.5s",   "destination": "q.worker.status.retry.5s",  "destination_type": "queue", "routing_key": "#", "arguments": {} },
+    { "vhost": "/", "source": "x.gateway.status.retry.30s",  "destination": "q.worker.status.retry.30s", "destination_type": "queue", "routing_key": "#", "arguments": {} },
+    { "vhost": "/", "source": "x.gateway.status.retry.5m",   "destination": "q.worker.status.retry.5m",  "destination_type": "queue", "routing_key": "#", "arguments": {} },
+
+    { "vhost": "/", "source": "x.dlx", "destination": "q.dlx", "destination_type": "queue", "routing_key": "dead.#", "arguments": {} }
+  ]
+}
