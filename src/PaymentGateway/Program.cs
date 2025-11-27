@@ -25,7 +25,8 @@ builder.Services.AddSingleton<Rmq.IConnection>(sp =>
         Uri = new Uri(amqpUri),
         AutomaticRecoveryEnabled = true
     };
-    return ((Rmq.IConnectionFactory)f).CreateConnection();
+    // v7 API is async; block for DI construction
+    return f.CreateConnectionAsync().GetAwaiter().GetResult();
 });
 
 builder.Services.AddHostedService(sp => new GatewayService(
@@ -47,8 +48,8 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var ch = connection.CreateModel();
-        ch.BasicQos(0, 16, false);
+        await using var ch = await connection.CreateChannelAsync();
+        await ch.BasicQosAsync(0, 16, false);
         var consumer = new AsyncEventingBasicConsumer(ch);
         consumer.ReceivedAsync += async (_, ea) =>
         {
@@ -78,7 +79,7 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
 
                 // Intermediate status
                 var intermediateRk = Topology.GatewayStatusIntermediate(provider);
-                PublishStatus(ch, intermediateRk, paymentId, parentCtx, new
+                await PublishStatusAsync(ch, intermediateRk, paymentId, parentCtx, new
                 {
                     payment_id = paymentId,
                     provider,
@@ -91,7 +92,7 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
 
                 // Final status
                 var finalRk = Topology.GatewayStatusFinal(provider);
-                PublishStatus(ch, finalRk, paymentId, parentCtx, new
+                await PublishStatusAsync(ch, finalRk, paymentId, parentCtx, new
                 {
                     payment_id = paymentId,
                     provider,
@@ -99,7 +100,7 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
                     emitted_at = DateTimeOffset.UtcNow
                 });
 
-                ch.BasicAck(ea.DeliveryTag, false);
+                await ch.BasicAckAsync(ea.DeliveryTag, false);
                 logger.LogInformation("Processed payment dispatch payment={PaymentId}", paymentId);
             }
             catch (TransientGatewayException tex)
@@ -114,29 +115,25 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
                 }
 
                 var retryExchange = Topology.NextRequestRetryExchange(retryCount);
-                using var ch2 = connection.CreateModel();
-                var props = ch2.CreateBasicProperties();
-                props.Persistent = true;
-                props.Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount, ["provider"] = provider };
-                ch2.BasicPublish(retryExchange, rk, props, ea.Body);
-                ch.BasicAck(ea.DeliveryTag, false);
+                await using var ch2 = await connection.CreateChannelAsync();
+                var props = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount, ["provider"] = provider } };
+                await ch2.BasicPublishAsync(retryExchange, rk, true, props, ea.Body, CancellationToken.None);
+                await ch.BasicAckAsync(ea.DeliveryTag, false);
                 logger.LogWarning(tex, "Gateway transient error, republished to {Ex} rk={Rk} retry={Retry}", retryExchange, rk, retryCount);
             }
             catch (Exception ex)
             {
                 // Terminal failure: route to DLX
-                using var ch3 = connection.CreateModel();
-                var props = ch3.CreateBasicProperties();
-                props.Persistent = true;
-                props.Headers = new Dictionary<string, object> { ["reason"] = ex.GetType().Name };
+                await using var ch3 = await connection.CreateChannelAsync();
+                var props = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["reason"] = ex.GetType().Name } };
                 var deadKey = $"dead.{rk}";
-                ch3.BasicPublish(Topology.ExchangeDlx, deadKey, props, ea.Body);
-                ch.BasicAck(ea.DeliveryTag, false);
+                await ch3.BasicPublishAsync(Topology.ExchangeDlx, deadKey, true, props, ea.Body, CancellationToken.None);
+                await ch.BasicAckAsync(ea.DeliveryTag, false);
                 logger.LogError(ex, "Gateway terminal error, sent to DLX rk={Rk}", rk);
             }
             return;
         };
-        ch.BasicConsume(Topology.QueueGatewayRequestSimulated, false, consumer);
+        await ch.BasicConsumeAsync(Topology.QueueGatewayRequestSimulated, false, consumer);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -144,10 +141,10 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
         }
     }
 
-    private void PublishStatus(IModel ch, string routingKey, Guid paymentId, ActivityContext parentCtx, object body)
+    private async Task PublishStatusAsync(IChannel ch, string routingKey, Guid paymentId, ActivityContext parentCtx, object body)
     {
-        var props = ch.CreateBasicProperties();
-        props.Persistent = true;
+        var props = new BasicProperties();
+        props.DeliveryMode = DeliveryModes.Persistent;
         props.MessageId = Guid.NewGuid().ToString();
         props.CorrelationId = paymentId.ToString();
         props.Headers = new Dictionary<string, object> { ["provider"] = provider, ["schema_version"] = 1, ["x-retry-count"] = 0 };
@@ -160,7 +157,7 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
         }
 
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(body));
-        ch.BasicPublish(Topology.ExchangeGatewayStatus, routingKey, true, props, bytes);
+        await ch.BasicPublishAsync(Topology.ExchangeGatewayStatus, routingKey, true, props, bytes, CancellationToken.None);
     }
 }
 

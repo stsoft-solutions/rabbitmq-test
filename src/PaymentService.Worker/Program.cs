@@ -26,7 +26,8 @@ builder.Services.AddSingleton<Rmq.IConnection>(sp =>
         Uri = new Uri(amqpUri),
         AutomaticRecoveryEnabled = true
     };
-    return f.CreateConnection();
+    // v7 API is async; block here for DI creation
+    return f.CreateConnectionAsync().GetAwaiter().GetResult();
 });
 
 builder.Services.AddHostedService<OutboxPublisherService>();
@@ -48,8 +49,7 @@ internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, Np
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var channel = connection.CreateModel();
-        channel.ConfirmSelect();
+        await using var channel = await connection.CreateChannelAsync();
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -66,8 +66,8 @@ internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, Np
                     var provider = (string)(it.payload?.gateway_provider ?? "simulated");
                     var routingKey = Topology.GatewayRequestCreated(provider);
                     var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(it.payload));
-                    var props = channel.CreateBasicProperties();
-                    props.Persistent = true;
+                    var props = new BasicProperties();
+                    props.DeliveryMode = DeliveryModes.Persistent; // persistent
                     // Reuse message_id and propagate trace context
                     var messageId = (Guid)it.message_id;
                     props.MessageId = messageId.ToString();
@@ -96,12 +96,7 @@ internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, Np
                     if (!string.IsNullOrEmpty(tracestate)) props.Headers["tracestate"] = tracestate;
                     if (!string.IsNullOrEmpty(baggage)) props.Headers["baggage"] = baggage;
 
-                    channel.BasicPublish(Topology.ExchangeGatewayRequest, routingKey, true, props, body);
-                    if (!channel.WaitForConfirms(TimeSpan.FromSeconds(5)))
-                    {
-                        await BackoffAsync(ds, it.id, it.attempt_count + 1, stoppingToken);
-                        continue;
-                    }
+                    await channel.BasicPublishAsync(Topology.ExchangeGatewayRequest, routingKey, true, props, body, CancellationToken.None);
 
                     // Cast dynamic values to static types to avoid dynamic dispatch on logger extension methods
                     var outboxId = (long)it.id;
@@ -173,16 +168,15 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var channel = connection.CreateModel();
-        channel.BasicQos(0, 32, false);
+        await using var channel = await connection.CreateChannelAsync();
+        await channel.BasicQosAsync(0, 32, false);
         var consumer = new AsyncEventingBasicConsumer(channel);
         consumer.ReceivedAsync += async (_, ea) =>
         {
             try
             {
                 var messageId = ea.BasicProperties?.MessageId ?? Guid.NewGuid().ToString();
-                var body = ea.Body.ToArray();
-                var payload = JsonDocument.Parse(Encoding.UTF8.GetString(body.AsSpan())).RootElement;
+                var payload = JsonDocument.Parse(Encoding.UTF8.GetString(ea.Body.Span)).RootElement;
                 var provider = ea.BasicProperties?.Headers != null && ea.BasicProperties.Headers.TryGetValue("provider", out var pv)
                     ? pv?.ToString() ?? "simulated"
                     : "simulated";
@@ -216,7 +210,7 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
                     new { m = Guid.Parse(messageId), s = $"gateway.{provider}" }, tx);
                 if (rows == 0)
                 {
-                    channel.BasicAck(ea.DeliveryTag, false);
+                    await channel.BasicAckAsync(ea.DeliveryTag, false);
                     return;
                 }
 
@@ -225,7 +219,7 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
                 await conn.ExecuteAsync("insert into payment_status_history(payment_id, status, source) values(@pid,@st,'Worker')",
                     new { pid = paymentId, st = statusValue }, tx);
                 await tx.CommitAsync(stoppingToken);
-                channel.BasicAck(ea.DeliveryTag, false);
+                await channel.BasicAckAsync(ea.DeliveryTag, false);
             }
             catch (Exception ex)
             {
@@ -240,15 +234,13 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
                 }
 
                 var retryExchange = Topology.NextStatusRetryExchange(retryCount);
-                using var ch = connection.CreateModel();
-                var props = ch.CreateBasicProperties();
-                props.Persistent = true;
-                props.Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount };
-                ch.BasicPublish(retryExchange, rk, props, ea.Body);
+                await using var ch = await connection.CreateChannelAsync();
+                var republishProps = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount } };
+                await ch.BasicPublishAsync(retryExchange, rk, true, republishProps, ea.Body, CancellationToken.None);
                 // Ack original to prevent redelivery storm
                 try
                 {
-                    channel.BasicAck(ea.DeliveryTag, false);
+                    await channel.BasicAckAsync(ea.DeliveryTag, false);
                 }
                 catch
                 {
@@ -260,7 +252,7 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
             }
             return; // ensure Task-returning delegate completes
         };
-        channel.BasicConsume(Topology.QueueWorkerStatus, false, consumer);
+        await channel.BasicConsumeAsync(Topology.QueueWorkerStatus, false, consumer);
 
         while (!stoppingToken.IsCancellationRequested)
         {
