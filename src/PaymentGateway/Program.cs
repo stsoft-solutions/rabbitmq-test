@@ -9,7 +9,6 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using Rmq = RabbitMQ.Client;
 using Shared;
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -18,19 +17,17 @@ var amqpUri = builder.Configuration.GetValue<string>("Rabbit:Uri")
               ?? "amqp://guest:guest@localhost:5672/";
 var provider = builder.Configuration.GetValue<string>("Provider") ?? "simulated";
 
-builder.Services.AddSingleton<Rmq.IConnection>(sp =>
+builder.Services.AddSingleton<IConnectionFactory>(sp =>
 {
-    var f = new Rmq.ConnectionFactory
+    return new ConnectionFactory
     {
         Uri = new Uri(amqpUri),
         AutomaticRecoveryEnabled = true
     };
-    // v7 API is async; block for DI construction
-    return f.CreateConnectionAsync().GetAwaiter().GetResult();
 });
 
 builder.Services.AddHostedService(sp => new GatewayService(
-    sp.GetRequiredService<Rmq.IConnection>(),
+    sp.GetRequiredService<IConnectionFactory>(),
     sp.GetRequiredService<ILogger<GatewayService>>(),
     provider));
 
@@ -44,10 +41,11 @@ builder.Services.AddOpenTelemetry()
 var app = builder.Build();
 await app.RunAsync();
 
-internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService> logger, string provider) : BackgroundService
+internal class GatewayService(IConnectionFactory connectionFactory, ILogger<GatewayService> logger, string provider) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await using var connection = await connectionFactory.CreateConnectionAsync();
         await using var ch = await connection.CreateChannelAsync();
         await ch.BasicQosAsync(0, 16, false);
         var consumer = new AsyncEventingBasicConsumer(ch);
@@ -116,7 +114,11 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
 
                 var retryExchange = Topology.NextRequestRetryExchange(retryCount);
                 await using var ch2 = await connection.CreateChannelAsync();
-                var props = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount, ["provider"] = provider } };
+                var props = new BasicProperties
+                {
+                    DeliveryMode = DeliveryModes.Persistent,
+                    Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount, ["provider"] = provider }
+                };
                 await ch2.BasicPublishAsync(retryExchange, rk, true, props, ea.Body, CancellationToken.None);
                 await ch.BasicAckAsync(ea.DeliveryTag, false);
                 logger.LogWarning(tex, "Gateway transient error, republished to {Ex} rk={Rk} retry={Retry}", retryExchange, rk, retryCount);
@@ -125,13 +127,15 @@ internal class GatewayService(Rmq.IConnection connection, ILogger<GatewayService
             {
                 // Terminal failure: route to DLX
                 await using var ch3 = await connection.CreateChannelAsync();
-                var props = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["reason"] = ex.GetType().Name } };
+                var props = new BasicProperties
+                {
+                    DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["reason"] = ex.GetType().Name }
+                };
                 var deadKey = $"dead.{rk}";
                 await ch3.BasicPublishAsync(Topology.ExchangeDlx, deadKey, true, props, ea.Body, CancellationToken.None);
                 await ch.BasicAckAsync(ea.DeliveryTag, false);
                 logger.LogError(ex, "Gateway terminal error, sent to DLX rk={Rk}", rk);
             }
-            return;
         };
         await ch.BasicConsumeAsync(Topology.QueueGatewayRequestSimulated, false, consumer);
 

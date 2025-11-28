@@ -7,7 +7,6 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using Rmq = RabbitMQ.Client;
 using Shared;
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -19,15 +18,13 @@ var amqpUri = builder.Configuration.GetValue<string>("Rabbit:Uri")
               ?? "amqp://guest:guest@localhost:5672/";
 
 builder.Services.AddSingleton<NpgsqlDataSource>(_ => NpgsqlDataSource.Create(pg));
-builder.Services.AddSingleton<Rmq.IConnection>(sp =>
+builder.Services.AddSingleton<IConnectionFactory>(sp =>
 {
-    var f = new Rmq.ConnectionFactory
+    return new ConnectionFactory
     {
         Uri = new Uri(amqpUri),
         AutomaticRecoveryEnabled = true
     };
-    // v7 API is async; block here for DI creation
-    return f.CreateConnectionAsync().GetAwaiter().GetResult();
 });
 
 builder.Services.AddHostedService<OutboxPublisherService>();
@@ -44,11 +41,12 @@ var app = builder.Build();
 await app.RunAsync();
 
 // Background service: polls outbox and publishes to Rabbit with confirms
-internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataSource ds, Rmq.IConnection connection)
+internal class OutboxPublisherService(ILogger<OutboxPublisherService> logger, NpgsqlDataSource ds, IConnectionFactory connectionFactory)
     : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await using var connection = await connectionFactory.CreateConnectionAsync();
         await using var channel = await connection.CreateChannelAsync();
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -164,10 +162,12 @@ returning o.id, o.aggregate_id, o.type, o.payload, o.attempt_count, o.message_id
 }
 
 // Background service: consumes gateway status updates and updates DB idempotently
-internal class StatusConsumerService(ILogger<StatusConsumerService> logger, NpgsqlDataSource ds, Rmq.IConnection connection) : BackgroundService
+internal class StatusConsumerService(ILogger<StatusConsumerService> logger, NpgsqlDataSource ds, IConnectionFactory connectionFactory)
+    : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await using var connection = await connectionFactory.CreateConnectionAsync();
         await using var channel = await connection.CreateChannelAsync();
         await channel.BasicQosAsync(0, 32, false);
         var consumer = new AsyncEventingBasicConsumer(channel);
@@ -235,7 +235,10 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
 
                 var retryExchange = Topology.NextStatusRetryExchange(retryCount);
                 await using var ch = await connection.CreateChannelAsync();
-                var republishProps = new BasicProperties { DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount } };
+                var republishProps = new BasicProperties
+                {
+                    DeliveryMode = DeliveryModes.Persistent, Headers = new Dictionary<string, object> { ["x-retry-count"] = retryCount }
+                };
                 await ch.BasicPublishAsync(retryExchange, rk, true, republishProps, ea.Body, CancellationToken.None);
                 // Ack original to prevent redelivery storm
                 try
@@ -250,7 +253,6 @@ internal class StatusConsumerService(ILogger<StatusConsumerService> logger, Npgs
                 logger.LogWarning(ex, "Status processing failed; republished to {RetryExchange} rk={RoutingKey} retry={Retry}",
                     retryExchange, rk, retryCount);
             }
-            return; // ensure Task-returning delegate completes
         };
         await channel.BasicConsumeAsync(Topology.QueueWorkerStatus, false, consumer);
 
